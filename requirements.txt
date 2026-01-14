@@ -1,0 +1,13 @@
+torch==2.8.0
+torchaudio
+torchvision
+huggingface_hub
+gradio>=4.0.0
+numpy>=1.24.0
+accelerate
+Pillow>=9.0.0
+mmgp
+psutil
+modelscope
+peft
+mistral_common
