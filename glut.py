@@ -11,7 +11,7 @@ import socket
 import argparse
 import datetime
 import psutil
-from diffusers.pipelines.glm_image import GlmImagePipeline
+from glm_image import GlmImagePipeline
 from diffusers.models import GlmImageTransformer2DModel
 from diffusers.utils import load_image
 from transformers import GlmImageForConditionalGeneration, ByT5Tokenizer
