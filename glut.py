@@ -118,7 +118,7 @@ def get_cached_prior_tokens(prompt, height, width, image=None):
         )
     
     # 生成新的 prior tokens
-    print("🔄 编码提示词和生成 prior tokens（无进度条，时间较长，请耐心等待）...")
+    # print("🔄 编码提示词和生成 prior tokens（无进度条，时间较长，请耐心等待）...")
     prior_token_ids = None
     prior_image_token_ids = None
     prompt_embeds = None
@@ -292,6 +292,13 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
     print(start_msg)
     yield None, start_msg
     
+    # 检查缓存状态，如果未命中则提示
+    cache_key = (prompt, height, width, get_image_hash(None))
+    if prior_cache["key"] != cache_key or prior_cache["prior_token_ids"] is None:
+        msg = "🔄 编码提示词和生成 prior tokens（无进度条，时间较长，请耐心等待）..."
+        print(msg)
+        yield None, msg
+
     # 获取缓存的 prior tokens（文生图时 prior_image_token_ids 为 None）
     prior_token_ids, prior_image_token_ids, prompt_embeds = get_cached_prior_tokens(
         prompt=prompt, height=height, width=width, image=None
@@ -312,7 +319,8 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
             
             # T2I 使用缓存的 prior_token_ids 和 prompt_embeds
             with torch.inference_mode():
-                output = pipe(
+                # 使用 yield_progress=True 获取进度
+                generator_obj = pipe(
                     prompt_embeds=prompt_embeds,
                     prior_token_ids=prior_token_ids,
                     height=height,
@@ -320,7 +328,18 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
+                    yield_progress=True
                 )
+                
+                output = None
+                for res, step, total in generator_obj:
+                    if res is None:
+                        # 进度更新
+                        progress_msg = f"🚀 生成中 {step}/{total}..."
+                        yield results if results else None, progress_msg
+                    else:
+                        # 完成
+                        output = res
             
             # 记录单张图推理时间
             img_time = time.time() - img_start_time
@@ -411,6 +430,13 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
     print(start_msg)
     yield None, start_msg
     
+    # 检查缓存状态
+    cache_key = (prompt, height, width, get_image_hash(image))
+    if prior_cache["key"] != cache_key or prior_cache["prior_token_ids"] is None:
+        msg = "🔄 编码提示词和生成 prior tokens（无进度条，时间较长，请耐心等待）..."
+        print(msg)
+        yield None, msg
+
     # 获取缓存的 prior tokens（包含 prior_token_ids、prior_image_token_ids 和 prompt_embeds）
     prior_token_ids, prior_image_token_ids, prompt_embeds = get_cached_prior_tokens(
         prompt=prompt, height=height, width=width, image=image
@@ -431,7 +457,8 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
             
             # 使用缓存的 prior_token_ids、prior_image_token_ids 和 prompt_embeds
             with torch.inference_mode():
-                output = pipe(
+                # 使用 yield_progress=True 获取进度
+                generator_obj = pipe(
                     prompt_embeds=prompt_embeds,
                     prior_token_ids=prior_token_ids,
                     prior_image_token_ids=prior_image_token_ids,
@@ -441,7 +468,18 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
+                    yield_progress=True
                 )
+                
+                output = None
+                for res, step, total in generator_obj:
+                    if res is None:
+                        # 进度更新
+                        progress_msg = f"🚀 生成中 {step}/{total}..."
+                        yield results if results else None, progress_msg
+                    else:
+                        # 完成
+                        output = res
             
             # 记录单张图推理时间
             img_time = time.time() - img_start_time
@@ -587,6 +625,10 @@ with gr.Blocks() as demo:
                     )
                     
                     with gr.Row():
+                        run_btn_t2i = gr.Button("🎨 生成图像", variant="primary", scale=2)
+                        stop_button_t2i = gr.Button("⏹️ 停止", scale=1)
+                    
+                    with gr.Row():
                         width_t2i = gr.Slider(
                             label="宽度",
                             minimum=32,
@@ -634,9 +676,9 @@ with gr.Blocks() as demo:
                             step=1
                         )
                     
-                    with gr.Row():
-                        run_btn_t2i = gr.Button("🎨 生成图像", variant="primary", scale=2)
-                        stop_button_t2i = gr.Button("⏹️ 停止", scale=1)
+
+
+
                 
                 with gr.Column(scale=1):
                     result_t2i = gr.Gallery(
@@ -675,6 +717,10 @@ with gr.Blocks() as demo:
                         placeholder="输入不希望在图像中出现的内容...",
                         lines=1
                     )
+                    
+                    with gr.Row():
+                        run_btn_i2i = gr.Button("🎨 生成图像", variant="primary", scale=2)
+                        stop_button_i2i = gr.Button("⏹️ 停止", scale=1)
                     
                     with gr.Row():
                         width_i2i = gr.Slider(
@@ -725,9 +771,9 @@ with gr.Blocks() as demo:
                             step=1
                         )
                     
-                    with gr.Row():
-                        run_btn_i2i = gr.Button("🎨 生成图像", variant="primary", scale=2)
-                        stop_button_i2i = gr.Button("⏹️ 停止", scale=1)
+
+
+
                 
                 with gr.Column(scale=1):
                     info_i2i = gr.Textbox(

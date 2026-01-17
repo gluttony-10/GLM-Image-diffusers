@@ -555,6 +555,7 @@ class GlmImagePipeline(DiffusionPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 2048,
+        yield_progress: bool = False,
     ) -> Union[GlmImagePipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -579,6 +580,8 @@ class GlmImagePipeline(DiffusionPipeline):
                 Random generator for reproducibility.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 Output format: "pil", "np", or "latent".
+            yield_progress (`bool`, *optional*, defaults to `False`):
+                If True, the method will yield intermediate progress (None, step, total) and finally the result.
 
         Examples:
 
@@ -794,6 +797,9 @@ class GlmImagePipeline(DiffusionPipeline):
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+                
+                if yield_progress:
+                    yield None, i + 1, num_inference_steps
 
         self._current_timestep = None
         kv_caches.clear()
@@ -820,6 +826,12 @@ class GlmImagePipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
-
-        return GlmImagePipelineOutput(images=image)
+            res = (image,)
+        else:
+            res = GlmImagePipelineOutput(images=image)
+        
+        if yield_progress:
+            yield res, num_inference_steps, num_inference_steps
+            return
+        
+        return res
