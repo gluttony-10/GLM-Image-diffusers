@@ -1,7 +1,0 @@
-{
-    "NUM_INFERENCE_STEPS": "50",
-    "GUIDANCE_SCALE": "1.5",
-    "WIDTH": "1024",
-    "HEIGHT": "1024",
-    "RES_VRAM": "1000"
-}

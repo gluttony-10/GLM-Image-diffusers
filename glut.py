@@ -1,9 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore")
-import gc
 import os
 from PIL import Image, PngImagePlugin
-import json
 import time
 import torch
 import numpy as np
@@ -16,13 +14,14 @@ import psutil
 from diffusers.pipelines.glm_image import GlmImagePipeline
 from diffusers.models import GlmImageTransformer2DModel
 from diffusers.utils import load_image
-from transformers import GlmImageForConditionalGeneration
+from transformers import GlmImageForConditionalGeneration, ByT5Tokenizer
 
 parser = argparse.ArgumentParser() 
 parser.add_argument("--server_name", type=str, default="127.0.0.1", help="IP地址，局域网访问改为0.0.0.0")
 parser.add_argument("--server_port", type=int, default=7891, help="使用端口")
 parser.add_argument("--share", action="store_true", help="是否启用gradio共享")
 parser.add_argument("--compile", action="store_true", help="是否启用compile加速")
+parser.add_argument("--res_vram", type=int, default=1000, help="保留显存(MB)，默认1000")
 args = parser.parse_args()
 
 print(" 启动中，请耐心等待 bilibili@十字鱼 https://space.bilibili.com/893892")
@@ -53,22 +52,116 @@ mmgp = None
 stop_generation = False
 model_id = "models/GLM-Image-diffusers"
 
+# vision_language_encoder 缓存（缓存 prior_tokens 和 prompt_embeds）
+prior_cache = {
+    "key": None,  # (prompt, height, width, image_hash)
+    "prompt": None,  # 用于 prompt_embeds 缓存
+    "prior_token_ids": None,
+    "prior_image_token_ids": None,
+    "prompt_embeds": None,
+}
+
+# 启用 CUDA 加速优化
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True  # 自动寻找最优卷积算法
+    torch.backends.cuda.matmul.allow_tf32 = True  # 允许 TF32 矩阵乘法
+    torch.backends.cudnn.allow_tf32 = True  # 允许 TF32 加速
+
+
+def get_image_hash(img):
+    """获取图像的简单哈希值用于缓存"""
+    if img is None:
+        return None
+    # 使用图像尺寸和部分像素数据生成简单哈希
+    return hash((img.size, img.mode, img.tobytes()[:1000]))
+
+
+def get_cached_prompt_embeds(prompt):
+    """获取缓存的 prompt_embeds"""
+    global prior_cache
+    
+    # 检查缓存（只基于 prompt）
+    if prior_cache["prompt"] == prompt and prior_cache["prompt_embeds"] is not None:
+        print("📦 使用缓存的 prompt_embeds")
+        return prior_cache["prompt_embeds"]
+    
+    # 编码新的提示词
+    print("🔄 编码提示词...")
+    with torch.inference_mode():
+        prompt_embeds, _ = pipe.encode_prompt(
+            prompt=prompt,
+            do_classifier_free_guidance=False,
+        )
+    
+    # 更新缓存
+    prior_cache["prompt"] = prompt
+    prior_cache["prompt_embeds"] = prompt_embeds
+    
+    return prompt_embeds
+
+
+def get_cached_prior_tokens(prompt, height, width, image=None):
+    """获取缓存的 prior tokens，如果没有则生成"""
+    global prior_cache
+    
+    # 生成缓存键
+    image_hash = get_image_hash(image)
+    cache_key = (prompt, height, width, image_hash)
+    
+    # 检查缓存
+    if prior_cache["key"] == cache_key and prior_cache["prior_token_ids"] is not None:
+        print("📦 使用缓存的 vision_language_encoder 结果")
+        return (
+            prior_cache["prior_token_ids"],
+            prior_cache["prior_image_token_ids"],
+            prior_cache["prompt_embeds"],
+        )
+    
+    # 生成新的 prior tokens
+    print("🔄 编码提示词和生成 prior tokens（无进度条，时间较长，请耐心等待）...")
+    prior_token_ids = None
+    prior_image_token_ids = None
+    prompt_embeds = None
+    
+    try:
+        with torch.inference_mode():
+            # 生成 prior tokens（这是耗时的 vision_language_encoder 操作）
+            # 总是返回 (prior_token_ids, prior_image_token_ids) 元组
+            prior_token_ids, prior_image_token_ids = pipe.generate_prior_tokens(
+                prompt=prompt,
+                height=height,
+                width=width,
+                image=[image] if image is not None else None,
+            )
+            
+            # 编码提示词
+            prompt_embeds, _ = pipe.encode_prompt(
+                prompt=prompt,
+                do_classifier_free_guidance=False,
+            )
+    except Exception as e:
+        print(f"❌ 生成 prior tokens 失败: {e}")
+        raise
+    
+    # 更新缓存
+    prior_cache["key"] = cache_key
+    prior_cache["prior_token_ids"] = prior_token_ids
+    prior_cache["prior_image_token_ids"] = prior_image_token_ids
+    prior_cache["prompt_embeds"] = prompt_embeds
+    
+    return prior_token_ids, prior_image_token_ids, prompt_embeds
+
+
+
 # 确保输出文件夹存在
 os.makedirs("outputs", exist_ok=True)
 
-# 读取设置
-CONFIG_FILE = "config.json"
-config = {}
-if os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
 # 默认设置
-num_inference_steps_default = int(config.get("NUM_INFERENCE_STEPS", "50"))
-guidance_scale_default = float(config.get("GUIDANCE_SCALE", "1.5"))
-width_default = int(config.get("WIDTH", "1024"))
-height_default = int(config.get("HEIGHT", "1024"))
-res_vram = float(config.get("RES_VRAM", "1000"))
+num_inference_steps_default = 50
+guidance_scale_default = 1.5
+width_default = 1024
+height_default = 1024
+res_vram = args.res_vram
 
 
 def load_pipeline():
@@ -81,11 +174,19 @@ def load_pipeline():
             vision_lang_encoder_path = "models/GLM-Image-diffusers/vision_language_encoder-mmgp.safetensors"
             transformer_path = "models/GLM-Image-diffusers/transformer-mmgp.safetensors"
             
+            # 加载 tokenizer
+            tokenizer = ByT5Tokenizer.from_pretrained(
+                model_id,
+                subfolder="tokenizer",
+                use_fast=False,
+            )
+            
             # 先加载基础模型到 CPU
             pipe = GlmImagePipeline.from_pretrained(
                 model_id, 
                 vision_language_encoder = None,
                 transformer = None,
+                tokenizer = tokenizer,
                 torch_dtype=dtype,
             ).to("cpu")
             
@@ -119,6 +220,14 @@ def load_pipeline():
                 extraModelsToQuantize=["vision_language_encoder"], 
                 compile=True if args.compile else False,
             )
+            
+            # 启用 Channels Last 内存格式加速
+            if device == "cuda" and hasattr(pipe, 'transformer'):
+                try:
+                    pipe.transformer = pipe.transformer.to(memory_format=torch.channels_last)
+                    print("✅ Channels Last 内存格式已启用")
+                except Exception as e:
+                    print(f"⚠️ Channels Last 启用失败: {e}")
             
             print("✅ 量化模型加载完成！mmgp 配置完成，限制目标显存：" + str(budgets) + "MB")
                 
@@ -166,7 +275,8 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
     
     stop_generation = False
     results = []
-    start_time = time.time()  # 记录开始时间
+    inference_times = []
+    start_time = time.time()
     
     # 处理种子
     if seed_param < 0:
@@ -178,6 +288,15 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
     width = (width // 32) * 32
     height = (height // 32) * 32
     
+    start_msg = f"🚀 开始生成，共{batch_images}张，分辨率{width}x{height}，步数{num_inference_steps}..."
+    print(start_msg)
+    yield None, start_msg
+    
+    # 获取缓存的 prior tokens（文生图时 prior_image_token_ids 为 None）
+    prior_token_ids, prior_image_token_ids, prompt_embeds = get_cached_prior_tokens(
+        prompt=prompt, height=height, width=width, image=None
+    )
+    
     try:
         for i in range(batch_images):
             if stop_generation:
@@ -188,15 +307,24 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
             current_seed = seed + i
             generator = torch.Generator(device=device).manual_seed(current_seed)
             
-            # 生成图像
-            output = pipe(
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-            )
+            # 记录单张图推理开始时间
+            img_start_time = time.time()
+            
+            # T2I 使用缓存的 prior_token_ids 和 prompt_embeds
+            with torch.inference_mode():
+                output = pipe(
+                    prompt_embeds=prompt_embeds,
+                    prior_token_ids=prior_token_ids,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                )
+            
+            # 记录单张图推理时间
+            img_time = time.time() - img_start_time
+            inference_times.append(img_time)
             
             image = output.images[0]
             
@@ -218,18 +346,26 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
             image.save(filename, pnginfo=pnginfo)
             results.append(image)
             
-            yield results, f"✅ 种子数{current_seed}，保存地址: {filename}"
-            
-            # mmgp 会自动管理显存，这里只需要清理 Python 对象
-            gc.collect()
+            img_msg = f"✅ 第{i+1}张完成，种子{current_seed}，耗时{img_time:.2f}秒"
+            print(img_msg)
+            yield results, img_msg
         
-        # 计算总时间
-        end_time = time.time()
-        total_time = end_time - start_time
-        yield results, f"✅ 推理完成，共生成{len(results)}张图片，总耗时{total_time:.2f}秒"
+        # 计算总时间和平均时间
+        total_time = time.time() - start_time
+        avg_time = total_time / len(results) if results else 0
+        done_msg = f"✅ 推理完成，共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(done_msg)
+        yield results, done_msg
     
     except Exception as e:
-        yield results if results else None, f"❌ 生成失败: {str(e)}"
+        import traceback
+        error_msg = f"❌ 生成失败: {str(e)}"
+        print(error_msg)
+        print("=" * 80)
+        print("完整错误堆栈:")
+        traceback.print_exc()
+        print("=" * 80)
+        yield results if results else None, error_msg
 
 
 def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_steps,
@@ -253,7 +389,8 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
     
     stop_generation = False
     results = []
-    start_time = time.time()  # 记录开始时间
+    inference_times = []
+    start_time = time.time()
     
     # 处理输入图像
     if isinstance(image, dict):
@@ -270,6 +407,15 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
     width = (width // 32) * 32
     height = (height // 32) * 32
     
+    start_msg = f"🚀 开始生成，共{batch_images}张，分辨率{width}x{height}，步数{num_inference_steps}..."
+    print(start_msg)
+    yield None, start_msg
+    
+    # 获取缓存的 prior tokens（包含 prior_token_ids、prior_image_token_ids 和 prompt_embeds）
+    prior_token_ids, prior_image_token_ids, prompt_embeds = get_cached_prior_tokens(
+        prompt=prompt, height=height, width=width, image=image
+    )
+    
     try:
         for i in range(batch_images):
             if stop_generation:
@@ -280,16 +426,26 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
             current_seed = seed + i
             generator = torch.Generator(device=device).manual_seed(current_seed)
             
-            # 生成图像
-            output = pipe(
-                prompt=prompt,
-                image=[image],  # 可以输入多个图像，如 [image, image1]
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-            )
+            # 记录单张图推理开始时间
+            img_start_time = time.time()
+            
+            # 使用缓存的 prior_token_ids、prior_image_token_ids 和 prompt_embeds
+            with torch.inference_mode():
+                output = pipe(
+                    prompt_embeds=prompt_embeds,
+                    prior_token_ids=prior_token_ids,
+                    prior_image_token_ids=prior_image_token_ids,
+                    image=[image],
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                )
+            
+            # 记录单张图推理时间
+            img_time = time.time() - img_start_time
+            inference_times.append(img_time)
             
             generated_image = output.images[0]
             
@@ -311,18 +467,26 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
             generated_image.save(filename, pnginfo=pnginfo)
             results.append(generated_image)
             
-            yield results, f"✅ 种子数{current_seed}，保存地址: {filename}"
-            
-            # mmgp 会自动管理显存，这里只需要清理 Python 对象
-            gc.collect()
+            img_msg = f"✅ 第{i+1}张完成，种子{current_seed}，耗时{img_time:.2f}秒"
+            print(img_msg)
+            yield results, img_msg
         
-        # 计算总时间
-        end_time = time.time()
-        total_time = end_time - start_time
-        yield results, f"✅ 推理完成，共生成{len(results)}张图片，总耗时{total_time:.2f}秒"
+        # 计算总时间和平均时间
+        total_time = time.time() - start_time
+        avg_time = total_time / len(results) if results else 0
+        done_msg = f"✅ 推理完成，共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(done_msg)
+        yield results, done_msg
     
     except Exception as e:
-        yield results if results else None, f"❌ 生成失败: {str(e)}"
+        import traceback
+        error_msg = f"❌ 生成失败: {str(e)}"
+        print(error_msg)
+        print("=" * 80)
+        print("完整错误堆栈:")
+        traceback.print_exc()
+        print("=" * 80)
+        yield results if results else None, error_msg
 
 
 def exchange_width_height(width, height):
@@ -337,6 +501,49 @@ def scale_resolution_1_5(width, height):
     new_width = int(width * 1.5) // 32 * 32
     new_height = int(height * 1.5) // 32 * 32
     return new_width, new_height, "✅ 分辨率已调整为1.5倍"
+
+
+def calculate_dimensions(target_area, ratio):
+    """
+    根据目标像素面积和宽高比计算宽高
+    """
+    import math
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+    return int(width), int(height)
+
+
+def auto_adjust_resolution(image):
+    """
+    根据上传的图像自动调整宽高（等效 1024x1024 像素面积）
+    """
+    if image is None:
+        return width_default, height_default, ""
+    
+    # 处理不同类型的输入
+    if isinstance(image, dict):
+        image = image.get("background", image)
+    
+    # 获取图像尺寸
+    if hasattr(image, 'size'):  # PIL Image
+        img_width, img_height = image.size
+    elif hasattr(image, 'shape'):  # numpy array
+        img_height, img_width = image.shape[:2]
+    else:
+        return width_default, height_default, ""
+    
+    # 计算等效 1024x1024 的尺寸（保持宽高比）
+    target_area = 1024 * 1024  # 目标像素面积
+    ratio = img_width / img_height
+    new_width, new_height = calculate_dimensions(target_area, ratio)
+    
+    # 确保在有效范围内
+    new_width = max(32, min(2048, new_width))
+    new_height = max(32, min(2048, new_height))
+    
+    return new_width, new_height, f"✅ 已调整为 {new_width}x{new_height}（等效1024²）"
 
 
 # 创建 Gradio 界面
@@ -453,7 +660,8 @@ with gr.Blocks() as demo:
                     image_i2i = gr.Image(
                         label="输入图像",
                         type="pil",
-                        sources=["upload", "clipboard"]
+                        sources=["upload", "clipboard"],
+                        height=500
                     )
                     
                     prompt_i2i = gr.Textbox(
@@ -522,6 +730,11 @@ with gr.Blocks() as demo:
                         stop_button_i2i = gr.Button("⏹️ 停止", scale=1)
                 
                 with gr.Column(scale=1):
+                    info_i2i = gr.Textbox(
+                        label="信息",
+                        lines=3,
+                        interactive=False
+                    )
                     result_i2i = gr.Gallery(
                         label="生成结果",
                         show_label=True,
@@ -530,11 +743,7 @@ with gr.Blocks() as demo:
                         rows=2,
                         height="auto"
                     )
-                    info_i2i = gr.Textbox(
-                        label="信息",
-                        lines=3,
-                        interactive=False
-                    )
+                    
     
     # 绑定事件
     # T2I 事件
@@ -585,16 +794,10 @@ with gr.Blocks() as demo:
         outputs=[width_i2i, height_i2i, info_i2i]
     )
     
-    adjust_button_i2i.click(
-        fn=adjust_width_height,
+    # 上传图像后自动调整宽高
+    image_i2i.change(
+        fn=auto_adjust_resolution,
         inputs=[image_i2i],
-        outputs=[width_i2i, height_i2i, info_i2i]
-    )
-    
-    # 上传图片时自动调整宽高
-    image_i2i.upload(
-        fn=adjust_width_height, 
-        inputs=[image_i2i], 
         outputs=[width_i2i, height_i2i, info_i2i]
     )
 
