@@ -319,8 +319,7 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
             
             # T2I 使用缓存的 prior_token_ids 和 prompt_embeds
             with torch.inference_mode():
-                # 使用 yield_progress=True 获取进度
-                generator_obj = pipe(
+                output = pipe(
                     prompt_embeds=prompt_embeds,
                     prior_token_ids=prior_token_ids,
                     height=height,
@@ -328,18 +327,7 @@ def generate_t2i(prompt, negative_prompt, width, height, num_inference_steps,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
-                    yield_progress=True
                 )
-                
-                output = None
-                for res, step, total in generator_obj:
-                    if res is None:
-                        # 进度更新
-                        progress_msg = f"🚀 生成中 {step}/{total}..."
-                        yield results if results else None, progress_msg
-                    else:
-                        # 完成
-                        output = res
             
             # 记录单张图推理时间
             img_time = time.time() - img_start_time
@@ -457,8 +445,7 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
             
             # 使用缓存的 prior_token_ids、prior_image_token_ids 和 prompt_embeds
             with torch.inference_mode():
-                # 使用 yield_progress=True 获取进度
-                generator_obj = pipe(
+                output = pipe(
                     prompt_embeds=prompt_embeds,
                     prior_token_ids=prior_token_ids,
                     prior_image_token_ids=prior_image_token_ids,
@@ -468,18 +455,7 @@ def generate_i2i(image, prompt, negative_prompt, width, height, num_inference_st
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     generator=generator,
-                    yield_progress=True
                 )
-                
-                output = None
-                for res, step, total in generator_obj:
-                    if res is None:
-                        # 进度更新
-                        progress_msg = f"🚀 生成中 {step}/{total}..."
-                        yield results if results else None, progress_msg
-                    else:
-                        # 完成
-                        output = res
             
             # 记录单张图推理时间
             img_time = time.time() - img_start_time
@@ -677,10 +653,12 @@ with gr.Blocks() as demo:
                         )
                     
 
-
-
                 
                 with gr.Column(scale=1):
+                    info_t2i = gr.Textbox(
+                        label="生成信息",
+                        interactive=False
+                    )
                     result_t2i = gr.Gallery(
                         label="生成结果",
                         show_label=True,
@@ -688,11 +666,6 @@ with gr.Blocks() as demo:
                         columns=2,
                         rows=2,
                         height="auto"
-                    )
-                    info_t2i = gr.Textbox(
-                        label="信息",
-                        lines=3,
-                        interactive=False
                     )
         
         # Image to Image 标签页
@@ -772,13 +745,10 @@ with gr.Blocks() as demo:
                         )
                     
 
-
-
                 
                 with gr.Column(scale=1):
                     info_i2i = gr.Textbox(
-                        label="信息",
-                        lines=3,
+                        label="生成信息",
                         interactive=False
                     )
                     result_i2i = gr.Gallery(
