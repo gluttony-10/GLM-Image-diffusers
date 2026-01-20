@@ -44,7 +44,7 @@ python glut.py
 - `--res_vram`: 保留显存（MB），默认 1000
 
 ## 参考项目
-https://github.com/ZhipuAI/GLM-Image
+https://github.com/zai-org/GLM-Image
 
 https://github.com/deepbeepmeep/mmgp
 
